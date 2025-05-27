@@ -11,7 +11,7 @@ This repository contains:
 - A demo application `audio_offload` that supports:
   - FFT-based audio equalizer (bass/mid/treble)
   - ARM/DSP execution switching
-  - UART-based runtime control and logging
+  - IP-based(ethernet) runtime control and logging
 
 ---
 
@@ -57,7 +57,7 @@ example/audio_offload/
 Makefile                        - Top-level build file
 ```
 
-## RPMSG and DMABUF API Documentation
+## RPMSG, DMABUF & FW LOADER API Documentation
 ```
 RPMSG API Endpoints
 
@@ -118,6 +118,19 @@ dmabuf_heap_destroy
   Description: Destroys a DMA buffer and releases its resources.
   Parameters: params: A pointer to a struct dma_buf_params object that holds the DMA buffer parameters.
   Example: dmabuf_heap_destroy(&params);
+
+FW Loader API
+
+switch_firmware
+Description: Switches to a new firmware by stopping the current firmware, updating the symlink to the new firmware, and then starting the new firmware.
+Parameters:
+  new_fw: Path to the new firmware file to load.
+  fw_link: Path to the symlink that points to the current firmware.
+  remote_proc_state_path: Path to the file that controls the state of the remote processor.
+Return Value
+  0: Success
+  -1: Failure
+
 ```
 
 
@@ -145,17 +158,14 @@ audio_offload
 4. Monitor UART or system logs for output.
 
 
-## 📡 UART Commands
+## 📡 Ethernet Commands
 
-Send via UART (115200 baud):
 
 ```text
-SET BASS <value>
-SET MID <value>
-SET TREBLE <value>
+SET FFT INDEX <value>
 ```
 
-- Value: floating point gain (e.g. 1.5)
+- Value: Integer FFT bin index (e.g. 1)
 
 ---
 

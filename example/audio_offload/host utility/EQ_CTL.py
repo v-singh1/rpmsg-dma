@@ -1,4 +1,4 @@
-# GUI-V1.py – Full Final Version with Animated EQ Gain Curve and Debug Console
+# EQ_CTL-V2.py – Animated EQ Gain Curve and Debug Console
 import serial
 import threading
 import tkinter as tk
@@ -10,22 +10,78 @@ import re
 import sys
 import math
 from tkinter.scrolledtext import ScrolledText
+from tkinter import ttk
 import datetime
+import socket
+from collections import deque
+import numpy as np
+import matplotlib.ticker as ticker
 
-SERIAL_PORT = sys.argv[1] if len(sys.argv) > 1 else 'COM3'
+SAMPLE_RATE = 48000
+FFT_SIZE = 1024
+
+from threading import Lock
+waveform_lock = Lock()
+
+def compute_spectrum(samples):
+    if len(samples) < FFT_SIZE:
+        return [], []
+
+    # Convert to numpy and clip to int16 range just in case
+    sample_array = np.clip(np.array(list(samples)[-FFT_SIZE:], dtype=np.float32), -32768, 32767)
+    sample_array = np.clip(sample_array, -32768, 32767)
+    # Apply window
+    window = np.hanning(FFT_SIZE);
+    windowed = window * sample_array
+
+    # FFT
+    spectrum = np.fft.rfft(windowed)
+    freqs = np.fft.rfftfreq(FFT_SIZE, d=1.0 / SAMPLE_RATE)
+
+    # Full-scale reference
+    ref = 32768.0 # max absolute value for int16
+
+    magnitude = 20 * np.log10(np.abs(spectrum) / ref + 1e-12)
+
+    return freqs, magnitude, spectrum
+
+# Parse mode and address/port
+if len(sys.argv) < 3:
+    print("Usage: python GUI-V2.py <mode: uart|ip> <COM port|IP address>")
+    sys.exit(1)
+
+MODE = sys.argv[1].lower()
+ADDR = sys.argv[2]
+
+if MODE not in ["uart", "ip"]:
+    print("Mode must be 'uart' or 'ip'")
+    sys.exit(1)
+
+SERVER_IP = ADDR
+SERIAL_PORT = ADDR
+SERVER_PORT = 8888
+CMD_PORT = 8889
+
+RETRY_INTERVAL = 3  # seconds
+MAX_SAMPLES = 4096
+sock = None
+connected = False
 BAUD_RATE = 115200
 TIMEOUT = 1
 
-frame_numbers = []
-avg_amps = []
-latencies = []
+MAX_FRAMES = 2048
+MAX_FRAMES1 = 1024
+
+frame_numbers = deque(maxlen=MAX_FRAMES)
+avg_amps = deque(maxlen=MAX_FRAMES)
+latencies = deque(maxlen=MAX_FRAMES)
 modes = []
 summaries = []
-cpu_loads = []
-dsp_loads = []
+cpu_loads = deque(maxlen=MAX_FRAMES)
+dsp_loads = deque(maxlen=MAX_FRAMES)
+
 
 eq_gains = {"BASS": 1.0, "MID": 1.0, "TREBLE": 1.0}
-
 current_mode = "BOTH"
 ser = None
 is_running = False
@@ -49,8 +105,30 @@ live_summary = {
 }
 
 log_pattern = re.compile(
-    r"Frame\s+(\d+):\s+AvgAmp=([\d.]+),\s+Latency=([\d.]+)ms,\s+Mode=(CPU|DSP)\s+CPULoad=([\d.]+)%\s+DSPLoad=([\d.]+)%"
+    r"Frame\s+(\d+):\s+AvgAmp=([\d.]+),\s+Latency=([\d.]+)ms,\s+Mode=([A-Z]+)\s+CPULoad=([\d.]+)%\s+DSPLoad=([\d.]+)%"
 )
+
+def wait_for_cmd():
+    global sock_cmd, connected_cmd
+    sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock_cmd.connect((SERVER_IP, CMD_PORT))
+    connected_cmd = True
+    log_debug("Connected to device command channel!")
+
+def wait_for_connection():
+    global connected
+    global sock
+    while not connected:
+        log_debug("Waiting for device application to start...")
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((SERVER_IP, SERVER_PORT))
+            connected = True
+            clear_data()
+            log_debug("Connected to device!")
+        except Exception as e:
+            log_debug(f"Retrying in {RETRY_INTERVAL} seconds...")
+            time.sleep(RETRY_INTERVAL)
 
 def amplitude_to_dbfs(amp, peak=32767.0):
     if amp <= 0:
@@ -63,30 +141,71 @@ def log_debug(msg):
         log_console.insert(tk.END, msg + "\n")
         log_console.see(tk.END)
 
-def save_data():
-    # Generate a timestamp for unique file names
+def save_data_and_logs(event=None):
+    """
+    Save the current graphs (input/output spectra, amplitude, latency, load)
+    and the live summary values + raw logs to timestamped files.
+    """
+    # Force redraw of canvas to ensure latest data is rendered
+    canvas.draw()
+
+    # Generate timestamp
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Define file names automatically
-    graph_filename = f"graph_{timestamp}.png"
-    summary_filename = f"summary_{timestamp}.txt"
+    # 1) Save full figure (all subplots)
+    fig.savefig(f"EQ_graphs_{timestamp}.png")
+    log_debug(f"Graphs saved to EQ_graphs_{timestamp}.png")
 
-    # Save the current figure (graph)
-    fig.savefig(graph_filename)
-    log_debug(f"Graph automatically saved as: {graph_filename}")
+    # 2) Save summary to text
+    summary_file = f"EQ_summary_{timestamp}.txt"
+    with open(summary_file, 'w') as f:
+        f.write(f"Summary Data - {timestamp}")
+        f.write("="*40 + "")
+        f.write(f"Frames processed: {live_summary['frames']}")
+        f.write(f"Latency (ms): Min={live_summary['latency_min']:.2f}, Max={live_summary['latency_max']:.2f}, Avg={live_summary['latency_avg']:.2f}")
+        f.write(f"Amplitude (dBFS): Min={live_summary['amp_min']:.2f}, Max={live_summary['amp_max']:.2f}, Avg={live_summary['amp_avg']:.2f}")
+        f.write(f"CPU Load (%): Min={live_summary['cpu_min']:.1f}, Max={live_summary['cpu_max']:.1f}, Avg={live_summary['cpu_avg']:.1f}")
+        f.write(f"DSP Load (%): Min={live_summary['dsp_min']:.1f}, Max={live_summary['dsp_max']:.1f}, Avg={live_summary['dsp_avg']:.1f}")
+        f.write("Log Console Output:")
+        if log_console:
+            text = log_console.get("1.0", tk.END)
+            f.write(text + "")
+    log_debug(f"Summary saved to {summary_file}")
 
-    # Save the summary data automatically in a text file
-    with open(summary_filename, "w") as f:
-        f.write("Live Summary Data:\n")
-        f.write(f"Frames: {live_summary['frames']}\n")
-        f.write(f"Latency (ms): Min: {live_summary['latency_min']:.2f}, Max: {live_summary['latency_max']:.2f}, Avg: {live_summary['latency_avg']:.2f}\n")
-        f.write(f"Amplitude: Min: {live_summary['amp_min']:.2f}, Max: {live_summary['amp_max']:.2f}, Avg: {live_summary['amp_avg']:.2f}\n")
-        f.write(f"CPU Load (%): Min: {live_summary['cpu_min']:.1f}, Max: {live_summary['cpu_max']:.1f}, Avg: {live_summary['cpu_avg']:.1f}\n")
-        f.write(f"DSP Load (%): Min: {live_summary['dsp_min']:.1f}, Max: {live_summary['dsp_max']:.1f}, Avg: {live_summary['dsp_avg']:.1f}\n")
-        f.write("\nSummary Log Lines:\n")
-        for line in summaries:
-            f.write(line + "\n")
-    log_debug(f"Summary data automatically saved as: {summary_filename}")
+    # 3) Save raw sample buffers
+    input_csv = f"input_samples_{timestamp}.csv"
+    output_csv = f"output_samples_{timestamp}.csv"
+    np.savetxt(input_csv, list(waveform_insamples)[-FFT_SIZE:], delimiter=',', header='InputSamples', comments='')
+    np.savetxt(output_csv, list(waveform_outsamples)[-FFT_SIZE:], delimiter=',', header='OutputSamples', comments='')
+    log_debug(f"Raw buffers saved to {input_csv} and {output_csv}")
+
+    # Generate timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 1) Save full figure (all subplots)
+    fig.savefig(f"EQ_graphs_{timestamp}.png")
+    log_debug(f"Graphs saved to EQ_graphs_{timestamp}.png")
+
+    # 2) Save summary to text
+    summary_file = f"EQ_summary_{timestamp}.txt"
+    with open(summary_file, 'w') as f:
+        f.write(f"Summary Data - {timestamp}\n")
+        f.write("="*40 + "\n")
+        f.write(f"Frames processed: {live_summary['frames']}\n")
+        f.write(f"Latency (ms): Min={live_summary['latency_min']:.2f}, Max={live_summary['latency_max']:.2f}, Avg={live_summary['latency_avg']:.2f}\n")
+        f.write(f"Amplitude (dBFS): Min={live_summary['amp_min']:.2f}, Max={live_summary['amp_max']:.2f}, Avg={live_summary['amp_avg']:.2f}\n")
+        f.write(f"CPU Load (%): Min={live_summary['cpu_min']:.1f}, Max={live_summary['cpu_max']:.1f}, Avg={live_summary['cpu_avg']:.1f}\n")
+        f.write(f"DSP Load (%): Min={live_summary['dsp_min']:.1f}, Max={live_summary['dsp_max']:.1f}, Avg={live_summary['dsp_avg']:.1f}\n")
+        f.write("\nLog Console Output:\n")
+        if log_console:
+            text = log_console.get("1.0", tk.END)
+            f.write(text)
+    log_debug(f"Summary saved to {summary_file}")
+
+    # 3) Optionally save raw sample buffers
+    np.savetxt(f"input_samples_{timestamp}.csv", list(waveform_insamples), delimiter=',', header='InputSamples', comments='')
+    np.savetxt(f"output_samples_{timestamp}.csv", list(waveform_outsamples), delimiter=',', header='OutputSamples', comments='')
+    log_debug(f"Raw buffers saved to input_samples_{timestamp}.csv and output_samples_{timestamp}.csv")
 
 def clear_data():
     frame_numbers.clear()
@@ -124,20 +243,37 @@ def clear_data():
     log_debug("[Cleared] Graph and logs reset")
 
 def send_command(cmd):
-    if ser and ser.is_open:
-        ser.write((cmd + '\n').encode())
-        log_debug("Sent → " + cmd)
+    global connected
+    global sock_cmd
+
+    if MODE == "ip":
+        sock_cmd.sendall((cmd + '\n').encode())
+    if MODE == "uart":
+        if ser and ser.is_open:
+            ser.write((cmd + '\n').encode())
+
+    #log_debug("Sent → " + cmd)
 
 def send_gain_command(gtype, val):
-    eq_gains[gtype.upper()] = val
-    send_command(f"SET {gtype.upper()} {val:.2f}")
-    canvas.draw_idle()
+    global connected
+
+    if connected:
+        eq_gains[gtype.upper()] = val
+        send_command(f"SET {gtype.upper()} {val}\n")
+        #print(f"SET {gtype.upper()} {val}")
+        canvas.draw_idle()
 
 def set_mode(mode):
     global current_mode
-    current_mode = mode.upper()
-    send_command(f"SET MODE {current_mode}")
-    highlight_buttons()
+
+    if mode != current_mode:
+        if current_mode == "ARM":
+            val = 0
+        else:
+            val = 1
+        current_mode = mode.upper()
+        send_command(f"SET MODE  {val}")
+        highlight_buttons()
 
 def toggle_test():
     global is_running
@@ -150,14 +286,10 @@ def toggle_test():
         is_running = True
 
 def highlight_buttons():
-    for btn in [arm_button, dsp_button, both_button]:
-        btn.config(bg="SystemButtonFace")
     if current_mode == "ARM":
-        arm_button.config(bg="lightblue")
+        arm_button.config(bg="blue")
     elif current_mode == "DSP":
-        dsp_button.config(bg="lightblue")
-    else:
-        both_button.config(bg="lightblue")
+        dsp_button.config(bg="green")
 
 def update_live_summary(line):
     global live_summary
@@ -167,12 +299,10 @@ def update_live_summary(line):
             parts = line.split(":")
             live_summary["frames"] = int(parts[1].strip())
             if live_summary["frames"] <= 20:
-                save_data()
+                save_data_and_logs()
                 clear_data()
             FRAME_SIZE = 256
             SAMPLE_RATE = 48000
-            play_time = frame_count * (FRAME_SIZE / SAMPLE_RATE)
-            live_summary["play_time"] = play_time
         elif line.startswith("[Live Summary] Latency"):
             # Example: "[Live Summary] Latency (ms): Min: 5.23, Max: 15.67, Avg: 8.90"
             m = re.search(r"Min:\s*([\d.]+),\s*Max:\s*([\d.]+),\s*Avg:\s*([\d.]+)", line)
@@ -205,27 +335,103 @@ def update_live_summary(line):
     except Exception as e:
         log_debug("Live summary parse error: " + str(e))
 
+waveform_insamples=deque(maxlen=MAX_SAMPLES)
+waveform_outsamples=deque(maxlen=MAX_SAMPLES)
 
-def read_uart():
+def read_data():
+    global sock
+    global waveform_insamples, waveform_outsamples, connected
+
+    recv_buffer = ""
+
+    if MODE == "ip":
+        wait_for_connection()
+        wait_for_cmd()
+        log_debug("Connected via IP")
+    elif MODE == "uart" and ser is not None:
+        connected = True
+        log_debug("Connected via UART")
+
     while True:
         try:
-            line = ser.readline().decode(errors='ignore').strip()
-            if not line:
+            if MODE == "ip":
+                data = sock.recv(1024).decode()
+            elif MODE == "uart":
+                data = ser.read(1024).decode()
+
+            if not data:
                 continue
-            log_debug("Recv ← " + line)
-            if ("[Live Summary]" in line):
-                update_live_summary(line)
-                parse_log_line(line)
-            if ("[Summary]" in line or "Frames Processed" in line or "Latency:" in line or line.startswith("Frame") or line.startswith("[Live Summary]")):
-#                summaries.append(line)
-                parse_log_line(line)
+
+#            print(f"[UART RAW] {data.strip()}")
+            recv_buffer += data
+            test = len(recv_buffer)
+            while "\n" in recv_buffer:
+                line, recv_buffer = recv_buffer.split("\n", 1)
+                line = line.strip().replace('\r', '')
+                if not line:
+                    continue
+
+                #print("[DEBUG] >>> LINE RECEIVED:", line)
+                # Input waveform (IWAVE: or IWAVE0:, IWAVE1:, etc.)
+                if line.startswith("IWAVE"):
+                    try:
+                        inraw_line = line
+                        raw = inraw_line.split(":", 1)[1].strip().rstrip(',')
+                        tokens = raw.split(',')
+                        samples = []
+
+                        for tok in tokens:
+                            if tok.strip() and tok.strip() != '-':
+                                try:
+                                    val = int(tok.strip())
+                                    samples.append(val)
+                                except Exception as e:
+                                    print(f"Invalid Token: '{tok}'")
+                            with waveform_lock:
+                                waveform_insamples.extend(samples)
+                    except Exception as e:
+                        log_debug("IWAVE parse error: " + str(e))
+
+                # Output waveform (WAVE: or WAVE0:, WAVE1:, etc.)
+                elif line.startswith("WAVE"):
+                    try:
+                        raw_line = line
+                        raw = raw_line.split(":", 1)[1].strip().rstrip(',')
+                        tokens = raw.split(',')
+                        samples = []
+                        for tok in tokens:
+                            if tok.strip() and tok.strip() != '-':
+                                try:
+                                    val = int(tok.strip())
+                                    samples.append(val)
+                                except Exception as e:
+                                    print(f"Invalid Token: '{tok}'")
+                            with waveform_lock:
+                                waveform_outsamples.extend(samples)
+                    except Exception as e:
+                        log_debug("WAVE parse error: " + str(e))
+
+                # Live Summary handling
+                if "[Live Summary]" in line:
+                    update_live_summary(line)
+
+                # General summary or frame log lines
+                if ("[Summary]" in line or "Frames Processed" in line or "Latency:" in line or line.startswith("Frame")):
+                    parse_log_line(line)
+
         except Exception as e:
+            connected = False
+            #wait_for_connection()
             log_debug("UART error: " + str(e))
+
+
+modeDisplay = "false"
 
 def parse_log_line(line):
     try:
         match = log_pattern.search(line)
         if not match:
+            log_debug("U PARSE Error")
             return
         frame = int(match.group(1))
         avg_amp = float(match.group(2))
@@ -236,6 +442,7 @@ def parse_log_line(line):
 
         mapped_mode = "CPU" if current_mode == "ARM" else "DSP" if current_mode == "DSP" else "BOTH"
         if mapped_mode != "BOTH" and mode != mapped_mode:
+            log_debug("U PARSE Error1 ")
             return
 
         avg_db = amplitude_to_dbfs(avg_amp)
@@ -255,44 +462,53 @@ def animate(i):
     ax2.clear()
     ax3.clear()
     ax4.clear()
-
+    ax5.clear()
     if not frame_numbers:
         return
 
     ax1.plot(frame_numbers, avg_amps, label="Avg Amplitude (dBFS)")
-    #ax1.axhline(y=-12, color='red', linestyle='--', label='Threshold -12 dBFS')
     ax1.set_ylabel("Amplitude (dBFS)")
     ax1.set_title("Average Amplitude")
     ax1.legend()
 
-    cpu_x = [frame_numbers[j] for j in range(len(modes)) if modes[j] == "CPU"]
-    cpu_y = [latencies[j] for j in range(len(modes)) if modes[j] == "CPU"]
-    dsp_x = [frame_numbers[j] for j in range(len(modes)) if modes[j] == "DSP"]
-    dsp_y = [latencies[j] for j in range(len(modes)) if modes[j] == "DSP"]
 
-    if cpu_x: ax2.plot(cpu_x, cpu_y, label="CPU Latency", color='blue')
-    if dsp_x: ax2.plot(dsp_x, dsp_y, label="DSP Latency", color='red')
+    min_len = min(len(frame_numbers), len(latencies), len(modes))
+    global modeDisplay
+
+    cpu_x, cpu_y = [], []
+    dsp_x, dsp_y = [], []
+
+    for j in range(min_len):
+        if modes[j] == "CPU":
+            cpu_x.append(frame_numbers[j])
+            cpu_y.append(latencies[j])
+        elif modes[j] == "DSP":
+            dsp_x.append(frame_numbers[j])
+            dsp_y.append(latencies[j])
+
+    if cpu_x:
+        ax2.plot(cpu_x, cpu_y, label="CPU Latency", color='blue')
+        if modeDisplay == "false":
+            tk.Label(left_frame, text="Running on A53 (Linux)", font=("Helvetica", 14, "bold"), bg = "#f0f0f0", fg = "black").pack(pady=40)
+            modeDisplay = "true"
+
+    if dsp_x:
+        ax2.plot(dsp_x, dsp_y, label="DSP Latency", color='green')
+        if modeDisplay == "false":
+            tk.Label(left_frame, text="Running on C7x", font=("Helvetica", 14, "bold"), bg = "#f0f0f0", fg = "black").pack(pady=40)
+            modeDisplay = "true"
+
     ax2.set_xlabel("Frame")
     ax2.set_ylabel("Latency (ms)")
     ax2.set_title("Frame Latency")
     ax2.legend()
 
-    ax3.plot(frame_numbers, cpu_loads, label="CPU Load (%)", color='orange')
-    ax3.plot(frame_numbers, dsp_loads, label="DSP Load (%)", color='green')
+    ax3.plot(frame_numbers, cpu_loads, label="CPU Load (%)", color='blue')
+    ax3.plot(frame_numbers, dsp_loads, label="DSP Load (%)", color='red')
     ax3.set_xlabel("Frame")
     ax3.set_ylabel("Load (%)")
     ax3.set_title("System Load")
     ax3.legend()
-
-    bands = [100, 1000, 10000]
-    gains = [eq_gains["BASS"], eq_gains["MID"], eq_gains["TREBLE"]]
-    ax4.plot(bands, gains, marker='o', linestyle='-', color='purple')
-    ax4.set_xscale("log")
-    ax4.set_xlabel("Frequency (Hz)")
-    ax4.set_ylabel("Gain")
-    ax4.set_title("EQ Gain Curve (Live)")
-    ax4.set_ylim(0, 2.2)
-    ax4.grid(True)
 
     # Update the static summary labels:
     frames_label.config(text=f"Frames: {live_summary['frames']}")
@@ -301,58 +517,81 @@ def animate(i):
     cpu_label.config(text=f"CPU Load (%): Min: {live_summary['cpu_min']:.1f}, Max: {live_summary['cpu_max']:.1f}, Avg: {live_summary['cpu_avg']:.1f}")
     dsp_label.config(text=f"DSP Load (%): Min: {live_summary['dsp_min']:.1f}, Max: {live_summary['dsp_max']:.1f}, Avg: {live_summary['dsp_avg']:.1f}")
 
-    #if summaries:
-     #   summary_label.config(text="\n".join(summaries[-7:]))
+    # Define custom frequency band markers (Hz)
+    audio_band_ticks = [ 1000, 2000, 4000, 8000, 12000, 16000]
+    audio_band_labels = [f"{int(f/1000)}k" if f >= 1000 else str(f) for f in audio_band_ticks]
 
-# Init serial
-ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
-threading.Thread(target=read_uart, daemon=True).start()
+    # Input Spectrum
+    if len(waveform_insamples) >= FFT_SIZE:
+        freqs, mag, spectrum = compute_spectrum(waveform_insamples)
+        #print(f"[INPUT DEBUG] Raw FFT peak magnitude: {np.max(np.abs(spec)):.2f}")
+        ax4.plot(freqs, mag, color='green')
+        ax4.set_title("Input Audio Spectrum")
+        ax4.set_ylabel("Amplitude (dBFS)")
+        ax4.set_xlabel("Frequency (Hz)")
+        ax4.set_ylim(-100, 15)
+        ax4.set_xlim(0, 16000)
+        for lvl in (-25, -50, -75):
+            ax4.axhline(lvl, linestyle='--', linewidth=0.8, label=f"{lvl} dB")
+        # Add kHz ticks
+        ax4.set_xticks(audio_band_ticks)
+        ax4.set_xticklabels(audio_band_labels)
+        ax4.grid(True, axis='x', linestyle='--', alpha=0.5)
+
+    # Output Spectrum
+    if len(waveform_outsamples) >= FFT_SIZE:
+        freqs, mag, spectrum = compute_spectrum(waveform_outsamples)
+        #print(f"[OUTPUT DEBUG] Raw FFT peak magnitude: {np.max(np.abs(spectrum)):.2f}")
+        ax5.plot(freqs, mag, color='blue')
+        ax5.set_title("Output Audio Spectrum")
+        ax5.set_ylabel("Amplitude (dBFS)")
+        ax5.set_xlabel("Frequency (Hz)")
+        ax5.set_ylim(-100, 15)
+        ax5.set_xlim(0, 16000)
+        for lvl in (-25, -50, -75):
+            ax5.axhline(lvl, linestyle='--', linewidth=0.8, label=f"{lvl} dB")
+        # Add kHz ticks
+        ax5.set_xticks(audio_band_ticks)
+        ax5.set_xticklabels(audio_band_labels)
+        ax5.grid(True, axis='x', linestyle='--', alpha=0.5)
+
+if MODE == "uart":
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
+
+threading.Thread(target=read_data, daemon=True).start()
+
 
 # GUI Setup
 root = tk.Tk()
 root.title("Audio EQ GUI")
 root.attributes("-fullscreen", True)
-left_frame = tk.Frame(root)
+left_frame = tk.Frame(root,width=370, bg="#f0f0f0")
 left_frame.pack(side=tk.LEFT, fill=tk.Y)
+left_frame.pack_propagate(False)
 
-tk.Label(left_frame, text="Bass Gain").pack()
-bass_slider = tk.Scale(left_frame, from_=0.0, to=2.0, resolution=0.1, orient=tk.HORIZONTAL,
-    command=lambda val: send_gain_command("BASS", float(val)))
-bass_slider.set(1.0)
-bass_slider.pack()
+tk.Label(left_frame, text="FFT Index", font=("Helvetica", 14, "bold"), bg = "#f0f0f0", fg = "black").pack(pady=20)
+bass_slider = tk.Scale(left_frame, from_=0, to=256, resolution=1, length=300, width=30, orient=tk.HORIZONTAL,
+    command=lambda val: send_gain_command("BASS", val))
+bass_slider.set(0)
+bass_slider.pack(pady=5)
 
-tk.Label(left_frame, text="Mid Gain").pack()
-mid_slider = tk.Scale(left_frame, from_=0.0, to=2.0, resolution=0.1, orient=tk.HORIZONTAL,
-    command=lambda val: send_gain_command("MID", float(val)))
-mid_slider.set(1.0)
-mid_slider.pack()
+"""
+tk.Label(left_frame, text="Run Mode").pack()
+arm_button = tk.Button(left_frame, text="Run on A53", command=lambda: set_mode("ARM"))
+arm_button.pack(pady=2)
+dsp_button = tk.Button(left_frame, text="Run on C7x", command=lambda: set_mode("DSP"))
+dsp_button.pack(pady=2)
+highlight_buttons()
+"""
+middle_frame = tk.Frame(left_frame, bg="#f0f0f0")
+middle_frame.place(relx=0.5, rely=0.5, anchor="center")
 
-tk.Label(left_frame, text="Treble Gain").pack()
-treble_slider = tk.Scale(left_frame, from_=0.0, to=2.0, resolution=0.1, orient=tk.HORIZONTAL,
-    command=lambda val: send_gain_command("TREBLE", float(val)))
-treble_slider.set(1.0)
-treble_slider.pack()
+lable_font = ("Helvetica", 12, "bold")
 
-#tk.Label(left_frame, text="Run Mode").pack()
-#arm_button = tk.Button(left_frame, text="Run on ARM", command=lambda: set_mode("ARM"))
-#arm_button.pack(pady=2)
-#dsp_button = tk.Button(left_frame, text="Run on DSP", command=lambda: set_mode("DSP"))
-#dsp_button.pack(pady=2)
-#both_button = tk.Button(left_frame, text="Run on BOTH", command=lambda: set_mode("BOTH"))
-#both_button.pack(pady=2)
-#highlight_buttons()
+summary_label = tk.Label(middle_frame, text="Live Summary", font=("Helvetica", 14, "bold"), bg = "#f0f0f0", fg = "black")
+summary_label.pack(pady=20)
 
-#tk.Button(left_frame, text="Start/Stop Test", bg='green', command=toggle_test).pack(pady=8)
-tk.Button(left_frame, text="Clear Screen", bg='orange', command=clear_data).pack(pady=4)
-
-summary_label = tk.Label(left_frame, text="Summary Info", justify=tk.LEFT)
-summary_label.pack(pady=10)
-
-#log_console = ScrolledText(left_frame, height=10, width=45)
-#log_console.pack(pady=4)
-#log_console.insert(tk.END, "[Debug Console Initialized]\n")
-
-fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(10, 9), constrained_layout=True)
+fig, (ax4, ax5, ax1, ax2, ax3) = plt.subplots(5, 1, figsize=(10, 11), constrained_layout=True)
 canvas = FigureCanvasTkAgg(fig, master=root)
 canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 ani = animation.FuncAnimation(fig, animate, interval=500)
@@ -361,20 +600,19 @@ live_summary_frame = tk.Frame(left_frame, bd=2, relief=tk.GROOVE)
 live_summary_frame.pack(pady=10, fill=tk.X)
 
 # Create static labels for each summary field
-frames_label = tk.Label(live_summary_frame, text="Frames: 0", anchor="w", width=40)
-frames_label.pack()
+frames_label = tk.Label(middle_frame, text="Frames: 0", anchor="w", width=40, fg="blue", font=lable_font, bg="#f0f0f0")
+frames_label.pack(pady=5)
 
-latency_label = tk.Label(live_summary_frame, text="Latency (ms): Min: 0.00, Max: 0.00, Avg: 0.00", anchor="w", width=40)
-latency_label.pack()
+latency_label = tk.Label(middle_frame, text="Latency (ms): Min: 0.00, Max: 0.00, Avg: 0.00", anchor="w", width=40, fg="darkgreen", font=lable_font, bg="#f0f0f0")
+latency_label.pack(pady=5)
 
-amp_label = tk.Label(live_summary_frame, text="Amplitude: Min: 0.00, Max: 0.00, Avg: 0.00", anchor="w", width=40)
-amp_label.pack()
+amp_label = tk.Label(middle_frame, text="Amplitude: Min: 0.00, Max: 0.00, Avg: 0.00", anchor="w", width=40, fg="purple", font=lable_font, bg="#f0f0f0")
+amp_label.pack(pady=5)
 
-cpu_label = tk.Label(live_summary_frame, text="CPU Load (%): Min: 0.0, Max: 0.0, Avg: 0.0", anchor="w", width=40)
-cpu_label.pack()
+cpu_label = tk.Label(middle_frame, text="CPU Load (%): Min: 0.0, Max: 0.0, Avg: 0.0", anchor="w", width=40, fg="maroon", font=lable_font, bg="#f0f0f0")
+cpu_label.pack(pady=5)
 
-dsp_label = tk.Label(live_summary_frame, text="DSP Load (%): Min: 0.0, Max: 0.0, Avg: 0.0", anchor="w", width=40)
-dsp_label.pack()
-
-tk.Button(left_frame, text="Save Data", bg='lightgreen', command=save_data).pack(pady=40)
+dsp_label = tk.Label(middle_frame, text="DSP Load (%): Min: 0.0, Max: 0.0, Avg: 0.0", anchor="w", width=40, fg="darkorange", font=lable_font, bg="#f0f0f0")
+dsp_label.pack(pady=5)
+root.bind('<Control-s>', save_data_and_logs)
 root.mainloop()
