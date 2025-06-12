@@ -25,4 +25,4 @@ install(TARGETS rpmsg_audio_offload_example RUNTIME DESTINATION ${CMAKE_INSTALL_
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/config/dsp_offload.cfg
         DESTINATION /etc)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/audio_sample/sample_audio.wav
-        DESTINATION /opt)
+        DESTINATION /usr/share/)
