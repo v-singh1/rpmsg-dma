@@ -7,8 +7,8 @@ Welcome to the project documentation for **RPMsg DMA Offload**. This project dem
 ## 🧩 Overview
 
 This repository contains:
-- A shared library `librpmsg_dma.so` for interfacing with RPMsg and DMA Heaps
-- A demo application `audio_offload` that supports:
+- A shared library `libti_rpmsg_dma.so` for interfacing with RPMsg and DMA Heaps
+- A demo application `rpmsg_audio_offload_example` that supports:
   - FFT-based audio processing
   - ARM/DSP execution switching
   - IP-based(ethernet) runtime control and logging
@@ -27,7 +27,7 @@ This repository contains:
 |          |                 |
 |          v                 |
 |  +---------------------+    |
-|  |  librpmsg_dma.so    | <- Shared Library
+|  |  libti_rpmsg_dma.so  | <- Shared Library
 |  +---------------------+    |
 |          |                 |
 +----------|-----------------+
@@ -132,7 +132,19 @@ Return Value
   -1: Failure
 
 ```
+## 📦 Required Packages
+```
+To build the shared library and example application, install the following dependencies:
 
+- **CMake** (version 3.10 or newer)
+- **C compiler** (e.g., gcc)
+- **pkg-config**
+- **FFTW3** development files (`libfftw3-dev`)
+- **libsndfile** development files (`libsndfile1-dev`)
+- **ALSA** development files (`libasound2-dev`)
+- **ti-rpmsg-char** library (required, must be installed from Texas Instruments SDK or source)
+
+```
 
 ## ⚙ Build System
 ```
@@ -140,34 +152,55 @@ Run the following commands from the root:
 
 cmake -S . -B build
 cmake --build build
+
+- This will build:
+  - The shared library (`libti_rpmsg_dma.so`)
+  - The example application (`rpmsg_audio_offload_example`)
+
+To install the built files (requires root privileges):
+sudo cmake --install build
+
+This installs:
+- The library to `/usr/lib` (by default)
+- The example binary to `/usr/bin`
+- The configuration file (`dsp_offload.cfg`) to `/etc`
+- The sample audio file (`sample_audio.wav`) to `/usr/share/`
+
+**Optional:**  
+To build only the library or only the example, use:
+
+cmake -S . -B build -DBUILD_LIB=OFF    # disables library build
+cmake -S . -B build -DBUILD_EXAMPLE=OFF # disables example build
 ```
 
 ## ▶ Usage
 ```
 1. Flash image with `ti-rpmsg-char` support on AM62A/62D.
 2. Deploy:
-    - `librpmsg_dma.so` to `/usr/lib/`
-    - `audio_offload` to `/usr/bin/`
+    - `libti_rpmsg_dma.so` to `/usr/lib/`
+    - `rpmsg_audio_offload_example` to `/usr/bin/`
     - `dsp_offload.cfg` to `/etc/dsp_offload.cfg`
-    - `sample_audio.wav` to `/opt/sample_audio`
+    - `sample_audio.wav` to `/usr/share/sample_audio`
 
 3. Run:
-audio_offload
+rpmsg_audio_offload_example
 
 4. Monitor UART or system logs for output.
 
 
 ## 📡 Ethernet Commands
 
-
 ```text
 SET FFT INDEX <value>
-```
+`
 
 - Value: Integer FFT bin index (e.g. 1)
 
 ---
+```
 
 ## 📄 License
-
+```
 This project is licensed under the [MIT License](../LICENSE).
+
+```
