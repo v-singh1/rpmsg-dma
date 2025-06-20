@@ -122,22 +122,25 @@ void *run_eq_thread(void *arg)
 	SF_INFO sfinfo = {0};
 	SNDFILE *infile = sf_open(input_file, SFM_READ, &sfinfo);
 	if (!infile) {
-		fprintf(stderr, "Failed to open input WAV: %s\n", sf_strerror(NULL));
-		return NULL;
+		fprintf(stderr, "\n*****ERROR***** Failed to open input WAV: %s\n\n", sf_strerror(NULL));
+		start_requested = EXIT_PLAY;
+		pthread_exit(infile);
 	}
 
 	if (sfinfo.channels != CHANNELS || sfinfo.samplerate != SAMPLE_RATE) {
-		fprintf(stderr, "WAV file must be %d-ch %dHz\n", CHANNELS, SAMPLE_RATE);
+		fprintf(stderr, "\n*****ERROR***** WAV file must be %d-ch %dHz\n\n", CHANNELS, SAMPLE_RATE);
 		sf_close(infile);
-		return NULL;
+		start_requested = EXIT_PLAY;
+		pthread_exit(infile);
 	}
 
 	snd_pcm_t *pcm_handle;
 	int rc = snd_pcm_open(&pcm_handle, "default", SND_PCM_STREAM_PLAYBACK, 0);
 	if (rc < 0) {
-		fprintf(stderr, "snd_pcm_open error: %s\n", snd_strerror(rc));
+		fprintf(stderr, "\n*****ERROR***** snd_pcm_open error: %s\n\n", snd_strerror(rc));
 		sf_close(infile);
-		return NULL;
+		start_requested = EXIT_PLAY;
+		pthread_exit(infile);
 	}
 
 	rc = snd_pcm_set_params(pcm_handle,
@@ -148,10 +151,11 @@ void *run_eq_thread(void *arg)
                             1,
                             500000);
 	if (rc < 0) {
-		fprintf(stderr, "snd_pcm_set_params error: %s\n", snd_strerror(rc));
+		fprintf(stderr, "\n*****ERROR***** snd_pcm_set_params error: %s\n\n", snd_strerror(rc));
 		snd_pcm_close(pcm_handle);
 		sf_close(infile);
-		return NULL;
+		start_requested = EXIT_PLAY;
+		pthread_exit(infile);
 	}
 
 	while(1) {
@@ -263,7 +267,11 @@ int main(int argc, char **argv)
 		if(start_requested == START_PLAY)
 		{
 			start_requested = STOP_PLAY;
-			pthread_create(&eq_thread, NULL, run_eq_thread, (void *)input_file);
+			int ret = pthread_create(&eq_thread, NULL, run_eq_thread, (void *)input_file);
+			if(ret != 0) {
+				fprintf(stderr, "\n*****ERROR***** create thread faild: %s\n\n", snd_strerror(ret));
+				break;
+			}
 		}
 		else if(start_requested == EXIT_PLAY)
 		{
