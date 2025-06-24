@@ -26,3 +26,5 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/config/dsp_offload.cfg
         DESTINATION /etc)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/audio_sample/sample_audio.wav
         DESTINATION /usr/share/)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/firmware/dsp_audio_filter_offload.c75ss0-0.release.strip.out
+        DESTINATION /usr/lib/firmware)

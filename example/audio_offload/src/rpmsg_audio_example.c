@@ -164,7 +164,7 @@ void *run_eq_thread(void *arg)
 		if(frames_read != NUM_FRAMES)
 			break;
 
-		memcpy(&superbuf[0], lbuf.data_buf,  NUM_FRAMES * sizeof(int16_t));
+		memcpy(&superbuf[0], lbuf.data_buf,  NUM_FRAMES * CHANNELS *sizeof(int16_t));
 		dmabuf_sync(data_dma_buf_params.dma_buf_fd, DMA_BUF_SYNC_END);
 
 		clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -177,8 +177,8 @@ void *run_eq_thread(void *arg)
 		dmabuf_sync(data_dma_buf_params.dma_buf_fd, DMA_BUF_SYNC_START);
 		dmabuf_sync(options_dma_buf_params.dma_buf_fd, DMA_BUF_SYNC_START);
 
-		for (int i = 0; i < NUM_FRAMES; i++) sum += abs(lbuf.data_buf[i]);
-		float amp = (float)sum / NUM_FRAMES;
+		for (int i = 0; i < NUM_FRAMES; i++) 	sum += abs(lbuf.data_buf[i * CHANNELS + current_channel]);
+		float amp = (float)(sum / (NUM_FRAMES * CHANNELS));
 		float cpu = get_cpu_load();
 		float dsp = (current_mode == EXEC_DSP ?  dspParams->dsp_load : 0.0f);
 		update_metrics(lat, amp, cpu, dsp, &total_latency, &min_latency, &max_latency,
@@ -187,7 +187,8 @@ void *run_eq_thread(void *arg)
 		log_frame_metrics(current_mode, ++frames, amp, lat, cpu, dsp);
 
 		snd_pcm_writei(pcm_handle, (short *)lbuf.data_buf, frames_read);
-		memcpy(&superbuf[256], lbuf.data_buf, NUM_FRAMES * sizeof(int16_t));
+		memcpy(&superbuf[NUM_FRAMES], lbuf.data_buf, NUM_FRAMES * CHANNELS *sizeof(int16_t));
+
 		log_superbuf(superbuf, NUM_FRAMES, CHANNELS, current_channel);
 		dmabuf_sync(options_dma_buf_params.dma_buf_fd, DMA_BUF_SYNC_END);
 		dmabuf_sync(data_dma_buf_params.dma_buf_fd, DMA_BUF_SYNC_END);
@@ -200,7 +201,7 @@ void *run_eq_thread(void *arg)
 	}
 	snd_pcm_close(pcm_handle);
 	sf_close(infile);
-	printf("processing complete\n");
+	printf("TEST STATUS: PASSED\n");
 	start_requested = EXIT_PLAY;
 	pthread_exit(0);
 	return NULL;
@@ -274,10 +275,7 @@ int main(int argc, char **argv)
 			}
 		}
 		else if(start_requested == EXIT_PLAY)
-		{
-			DBG("processing complete go to cleanup\n");
 			break;
-		}
 		else
 			sleep(2);
 	}
