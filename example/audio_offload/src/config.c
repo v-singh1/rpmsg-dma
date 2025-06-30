@@ -32,9 +32,10 @@ void init_config_defaults()
 	app_config.remote_endpoint = 14;
 	app_config.data_buffer_size = 4096;
 	app_config.param_buffer_size = 4096;
-	app_config.fft_bin_index = 0;
+	app_config.fft_filter_enable = true;
 	app_config.is_host_eth_iface = true;
 	app_config.is_dsp_execution = true;
+	app_config.enable_audio_logging = false;
 }
 
 // ========== Config Loader ==========
@@ -97,7 +98,8 @@ void load_config(const char *filename)
 			else if (strcmp(key, "PARAM_SIZE") == 0) app_config.param_buffer_size = atoi(val);
 			else if (strcmp(key, "DSP_EXEC_MODE") == 0) app_config.is_dsp_execution = atoi(val);
 			else if (strcmp(key, "HOST_ETH_INTERFACE") == 0) app_config.is_host_eth_iface = atoi(val);
-			else if (strcmp(key, "sample_audio_file") == 0) app_config.fft_bin_index = atoi(val);
+			else if (strcmp(key, "FILTER_ENABLE") == 0) app_config.fft_filter_enable = atoi(val);
+			else if (strcmp(key, "AUDIO_LOGGING_ENABLE") == 0)  app_config.enable_audio_logging = atoi(val);
 		}
 	}
 	fclose(fp);
@@ -115,7 +117,8 @@ void print_config()
 	printf("param buffer size : %d\n", app_config.param_buffer_size);
 	printf("is DSP mode execution : %d\n", app_config.is_dsp_execution);
 	printf("Host eth interface : %d\n", app_config.is_host_eth_iface);
-	printf("FFT length : %d\n", app_config.fft_bin_index);
+	printf("Filter state : %d\n", app_config.fft_filter_enable);
+	printf("Audio logging to file : %d\n", app_config.enable_audio_logging);
 	printf("C7 new : %s\n", app_config.c7_new_fw_path);
 	printf("C7 old : %s\n", app_config.c7_old_fw_path);
 	printf("C7 state : %s\n", app_config.c7_state_path);

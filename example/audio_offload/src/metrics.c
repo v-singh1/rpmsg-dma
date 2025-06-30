@@ -1,40 +1,10 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include "metrics.h"
 #include "host_interface.h"
 
-#define MAX_LOG_LINE 2048
-
-void send_wave_in(int16_t *inbuf, int num_frames, int num_channels, int ch)
-{
-	if (ch < 0 || ch >= num_channels)
-		return;
-
-	char line[MAX_LOG_LINE];
-	int off = snprintf(line, sizeof(line), "IWAVE:");
-	for (int i = 0; i < num_frames; ++i) {
-		off += snprintf(line + off, sizeof(line) - off,
-			i == num_frames - 1 ? "%d\n" : "%d,", inbuf[i * num_channels + ch]);
-		if (off >= (int)sizeof(line)) break;
-	}
-	enqueue_log(line);
-}
-
-
-void send_wave_out(int16_t *outbuf, int num_frames, int num_channels, int ch)
-{
-	if (ch < 0 || ch >= num_channels)
-		return;
-
-	char line[MAX_LOG_LINE];
-	int off = snprintf(line, sizeof(line), "WAVE:");
-	for (int i = 0; i < num_frames; ++i) {
-		off += snprintf(line + off, sizeof(line) - off,
-			i == num_frames - 1 ? "%d\n" : "%d,", outbuf[i * num_channels + ch]);
-		if (off >= (int)sizeof(line)) break;
-	}
-	enqueue_log(line);
-}
+#define MAX_LOG_LINE 2048*12
 
 // ====================== Metrics & Logging  =========================
 
@@ -78,18 +48,30 @@ void update_metrics(float lat, float amp, float cpu, float dsp,
 	if (dsp > *max_dsp) *max_dsp = dsp;
 }
 
-void log_superbuf(int16_t *superbuf, int num_frames, int num_channels, int ch)
+void log_input_audio(int16_t *buf, int num_frames, int num_channels, int ch)
 {
-	send_wave_in(&superbuf[0], num_frames, num_channels, ch);
-	send_wave_out(&superbuf[num_frames], num_frames, num_channels, ch);
+	int16_t size = num_frames * num_channels * 2;
+	int16_t inbuf[size];
+
+	memcpy(inbuf, buf, size);
+	enqueue_input_buffer("INPT", inbuf, num_frames, num_channels, ch);
+}
+
+void log_output_audio(int16_t *buf, int num_frames, int num_channels, int ch)
+{
+	int16_t size = num_frames * num_channels * 2;
+	int16_t outbuf[size];
+
+	memcpy(outbuf, buf, size);
+	enqueue_output_buffer("OUTP", outbuf, num_frames, num_channels, ch);
 }
 
 void log_frame_metrics(int exec_mode, int frames, float amp, float lat, float cpu, float dsp)
 {
 	char logbuf[256];
 	snprintf(logbuf, sizeof(logbuf),
-	         "Frame %d: AvgAmp=%.2f, Latency=%.2fms, Mode=%s CPULoad=%.1f%% DSPLoad=%.1f%%",
-	         frames, amp, lat, exec_mode == 0 ? "CPU" : "DSP", cpu, dsp);
+			"Frame %d: AvgAmp=%.2f, Latency=%.2fms, Mode=%s CPULoad=%.1f%% DSPLoad=%.1f%%",
+			frames, amp, lat, exec_mode == 0 ? "CPU" : "DSP", cpu, dsp);
 	enqueue_log(logbuf);
 }
 
@@ -102,16 +84,16 @@ void log_summary(int frames, double total_latency, double min_latency, double ma
 	snprintf(buf, sizeof(buf), "[Live Summary] Frames: %d", frames);
 	enqueue_log(buf);
 	snprintf(buf, sizeof(buf), "[Live Summary] Latency (ms): Min: %.2f, Max: %.2f, Avg: %.2f",
-	         min_latency, max_latency, total_latency / frames);
+			min_latency, max_latency, total_latency / frames);
 	enqueue_log(buf);
 	snprintf(buf, sizeof(buf), "[Live Summary] Amp: Min: %.2f, Max: %.2f, Avg: %.2f",
-	         min_amp, max_amp, total_amp / frames);
+			min_amp, max_amp, total_amp / frames);
 	enqueue_log(buf);
 	snprintf(buf, sizeof(buf), "[Live Summary] CPU Load (%%): Min: %.1f, Max: %.1f, Avg: %.1f",
-	         min_cpu, max_cpu, total_cpu / frames);
+			min_cpu, max_cpu, total_cpu / frames);
 	enqueue_log(buf);
 	snprintf(buf, sizeof(buf), "[Live Summary] DSP Load (%%): Min: %.1f, Max: %.1f, Avg: %.1f",
-	         min_dsp, max_dsp, total_dsp / frames);
+			min_dsp, max_dsp, total_dsp / frames);
 	enqueue_log(buf);
 }
 

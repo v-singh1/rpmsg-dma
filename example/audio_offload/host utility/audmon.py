@@ -1,5 +1,4 @@
-# EQ_CTL-V2.py – Animated EQ Gain Curve and Debug Console
-import serial
+# audmon.py – Animated Audio monitoring and Debug Console
 import threading
 import tkinter as tk
 import matplotlib.pyplot as plt
@@ -7,6 +6,7 @@ import matplotlib.animation as animation
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import time
 import re
+import os
 import sys
 import math
 from tkinter.scrolledtext import ScrolledText
@@ -16,34 +16,9 @@ import socket
 from collections import deque
 import numpy as np
 import matplotlib.ticker as ticker
-
-SAMPLE_RATE = 48000
-FFT_SIZE = 1024
-
 from threading import Lock
-waveform_lock = Lock()
-
-def compute_spectrum(samples):
-    if len(samples) < FFT_SIZE:
-        return [], []
-
-    # Convert to numpy and clip to int16 range just in case
-    sample_array = np.clip(np.array(list(samples)[-FFT_SIZE:], dtype=np.float32), -32768, 32767)
-    sample_array = np.clip(sample_array, -32768, 32767)
-    # Apply window
-    window = np.hanning(FFT_SIZE);
-    windowed = window * sample_array
-
-    # FFT
-    spectrum = np.fft.rfft(windowed)
-    freqs = np.fft.rfftfreq(FFT_SIZE, d=1.0 / SAMPLE_RATE)
-
-    # Full-scale reference
-    ref = 32768.0 # max absolute value for int16
-
-    magnitude = 20 * np.log10(np.abs(spectrum) / ref + 1e-12)
-
-    return freqs, magnitude, spectrum
+from scipy.signal import get_window
+import serial
 
 # Parse mode and address/port
 if len(sys.argv) < 3:
@@ -52,27 +27,28 @@ if len(sys.argv) < 3:
 
 MODE = sys.argv[1].lower()
 ADDR = sys.argv[2]
-
-if MODE not in ["uart", "ip"]:
-    print("Mode must be 'uart' or 'ip'")
-    sys.exit(1)
-
+# --- CONFIGURATION ---
+SAMPLE_RATE = 48000
+FFT_SIZE = 1024
 SERVER_IP = ADDR
 SERIAL_PORT = ADDR
 SERVER_PORT = 8888
 CMD_PORT = 8889
-
-RETRY_INTERVAL = 3  # seconds
-MAX_SAMPLES = 4096
-sock = None
-sock_cmd = None
-connected = False
+IN_DATA_PORT = 8890
+OUT_DATA_PORT = 8891
 BAUD_RATE = 115200
 TIMEOUT = 1
-
 MAX_FRAMES = 2048
-MAX_FRAMES1 = 1024
+RETRY_INTERVAL = 3  # seconds
+MAX_SAMPLES = 2048
 
+# --- GLOBAL STATE ---
+sock = None
+sock_cmd = None
+sock_input_data = None
+sock_output_data = None
+connected = False
+connected_input_data = False
 frame_numbers = deque(maxlen=MAX_FRAMES)
 avg_amps = deque(maxlen=MAX_FRAMES)
 latencies = deque(maxlen=MAX_FRAMES)
@@ -80,12 +56,45 @@ modes = []
 summaries = []
 cpu_loads = deque(maxlen=MAX_FRAMES)
 dsp_loads = deque(maxlen=MAX_FRAMES)
-
-
+waveform_lock = Lock()
+waveform_insamples=deque(maxlen=MAX_SAMPLES)
+waveform_outsamples=deque(maxlen=MAX_SAMPLES)
 current_mode = "BOTH"
 ser = None
 is_running = False
 log_console = None
+node_label = None
+
+
+def compute_spectrum(samples):
+    """Compute FFT magnitude spectrum of a sample buffer."""
+    if len(samples) < FFT_SIZE:
+        return [], []
+
+    # Convert to numpy and clip to int16 range just in case
+    sample_array = np.clip(np.array(list(samples)[-FFT_SIZE:], dtype=np.float32), -32768, 32767)
+    sample_array = np.clip(sample_array, -32768, 32767)
+    # Apply window
+    #window = np.hanning(FFT_SIZE);
+    window = np.hamming(FFT_SIZE);
+    windowed = window * sample_array
+
+    # FFT
+    spectrum = np.fft.rfft(windowed)
+    freqs = np.fft.rfftfreq(FFT_SIZE, d=1.0 / SAMPLE_RATE)
+
+    # Full-scale reference
+    ref = 32768.0 # max absolute value for int16
+    ref = 10000.0 # max absolute value for int16
+
+    #magnitude = 20 * np.log10(np.abs(spectrum) / ref + 1e-12)
+    magnitude = 20 * np.log10(np.abs(spectrum) / ref)
+
+    return freqs, magnitude, spectrum
+
+if MODE not in ["uart", "ip"]:
+    print("Mode must be 'uart' or 'ip'")
+    sys.exit(1)
 
 # Global variables to hold live summary values
 live_summary = {
@@ -109,7 +118,9 @@ log_pattern = re.compile(
 )
 
 def wait_for_connection():
+    """Establish main data socket connection."""
     global connected, sock
+    connected = False;
     while not connected:
         log_debug("Waiting for device data connection...")
         try:
@@ -125,6 +136,7 @@ def wait_for_connection():
             time.sleep(RETRY_INTERVAL)
 
 def wait_for_cmd():
+    """Establish command socket connection."""
     global sock_cmd, connected_cmd
     connected_cmd = False
     while not connected_cmd:
@@ -139,35 +151,48 @@ def wait_for_cmd():
             log_debug(f"Waiting for CMD port... retrying in {RETRY_INTERVAL}s ({e})")
             time.sleep(RETRY_INTERVAL)
 
-"""
-def wait_for_cmd():
-    global sock_cmd, connected_cmd
-    sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock_cmd.connect((SERVER_IP, CMD_PORT))
-    connected_cmd = True
-    log_debug("Connected to device command channel!")
-
-def wait_for_connection():
-    global connected
-    global sock
-    while not connected:
-        log_debug("Waiting for device application to start...")
+def wait_for_indata():
+    """Connect to device's input audio data stream."""
+    global sock_input_data, connected_input_data
+    connected_input_data = False
+    while not connected_input_data:
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((SERVER_IP, SERVER_PORT))
-            connected = True
-            clear_data()
-            log_debug("Connected to device!")
+            if sock_input_data:
+                sock_input_data.close()
+            sock_input_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock_input_data.connect((SERVER_IP, IN_DATA_PORT))
+            connected_input_data = True
+            threading.Thread(target=read_input_audio_samples, daemon=True).start()
+            log_debug("Connected to device (input data)")
         except Exception as e:
-            log_debug(f"Retrying in {RETRY_INTERVAL} seconds...")
+            log_debug(f"Waiting for IN DATA port... retrying in {RETRY_INTERVAL}s ({e})")
             time.sleep(RETRY_INTERVAL)
-"""
+
+def wait_for_outdata():
+    """Connect to device's output audio data stream."""
+    global sock_output_data, connected_output_data
+    connected_output_data = False
+    while not connected_output_data:
+        try:
+            if sock_output_data:
+                sock_output_data.close()
+            sock_output_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock_output_data.connect((SERVER_IP, OUT_DATA_PORT))
+            connected_output_data = True
+            threading.Thread(target=read_output_audio_samples, daemon=True).start()
+            log_debug("Connected to device (out data)")
+        except Exception as e:
+            log_debug(f"Waiting for OUT DATA port... retrying in {RETRY_INTERVAL}s ({e})")
+            time.sleep(RETRY_INTERVAL)
+
 def amplitude_to_dbfs(amp, peak=32767.0):
+    """Convert linear amplitude to decibels full scale (dBFS)."""
     if amp <= 0:
         return -100.0
     return 20 * math.log10(amp / peak)
 
 def log_debug(msg):
+    """Log message to console and UI."""
     print("DEBUG:", msg)
     if log_console:
         log_console.insert(tk.END, msg + "\n")
@@ -176,8 +201,13 @@ def log_debug(msg):
 def save_data_and_logs(event=None):
     """
     Save the current graphs (input/output spectra, amplitude, latency, load)
-    and the live summary values + raw logs to timestamped files.
+    and the live summary values + raw logs to timestamped folder.
     """
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_dir = f"logs_{timestamp}"
+    os.makedirs(save_dir, exist_ok=True)
+
     # Force redraw of canvas to ensure latest data is rendered
     canvas.draw()
 
@@ -185,12 +215,13 @@ def save_data_and_logs(event=None):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # 1) Save full figure (all subplots)
-    fig.savefig(f"EQ_graphs_{timestamp}.png")
-    log_debug(f"Graphs saved to EQ_graphs_{timestamp}.png")
+    fig_path = os.path.join(save_dir, f"audmon_graphs_{timestamp}.png")
+    fig.savefig(fig_path)
+    log_debug(f"Graphs saved to {fig_path}")
 
     # 2) Save summary to text
-    summary_file = f"EQ_summary_{timestamp}.txt"
-    with open(summary_file, 'w') as f:
+    summary_file = os.path.join(save_dir, f"audmon_summary_{timestamp}.txt")
+    with open(summary_file, "w") as f:
         f.write(f"Summary Data - {timestamp}")
         f.write("="*40 + "")
         f.write(f"Frames processed: {live_summary['frames']}")
@@ -199,47 +230,17 @@ def save_data_and_logs(event=None):
         f.write(f"CPU Load (%): Min={live_summary['cpu_min']:.1f}, Max={live_summary['cpu_max']:.1f}, Avg={live_summary['cpu_avg']:.1f}")
         f.write(f"DSP Load (%): Min={live_summary['dsp_min']:.1f}, Max={live_summary['dsp_max']:.1f}, Avg={live_summary['dsp_avg']:.1f}")
         f.write("Log Console Output:")
-        if log_console:
-            text = log_console.get("1.0", tk.END)
-            f.write(text + "")
     log_debug(f"Summary saved to {summary_file}")
 
     # 3) Save raw sample buffers
-    input_csv = f"input_samples_{timestamp}.csv"
-    output_csv = f"output_samples_{timestamp}.csv"
+    input_csv = os.path.join(save_dir, f"input_samples_{timestamp}.csv")
+    output_csv = os.path.join(save_dir, f"output_samples_{timestamp}.csv")
     np.savetxt(input_csv, list(waveform_insamples)[-FFT_SIZE:], delimiter=',', header='InputSamples', comments='')
     np.savetxt(output_csv, list(waveform_outsamples)[-FFT_SIZE:], delimiter=',', header='OutputSamples', comments='')
     log_debug(f"Raw buffers saved to {input_csv} and {output_csv}")
 
-    # Generate timestamp
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # 1) Save full figure (all subplots)
-    fig.savefig(f"EQ_graphs_{timestamp}.png")
-    log_debug(f"Graphs saved to EQ_graphs_{timestamp}.png")
-
-    # 2) Save summary to text
-    summary_file = f"EQ_summary_{timestamp}.txt"
-    with open(summary_file, 'w') as f:
-        f.write(f"Summary Data - {timestamp}\n")
-        f.write("="*40 + "\n")
-        f.write(f"Frames processed: {live_summary['frames']}\n")
-        f.write(f"Latency (ms): Min={live_summary['latency_min']:.2f}, Max={live_summary['latency_max']:.2f}, Avg={live_summary['latency_avg']:.2f}\n")
-        f.write(f"Amplitude (dBFS): Min={live_summary['amp_min']:.2f}, Max={live_summary['amp_max']:.2f}, Avg={live_summary['amp_avg']:.2f}\n")
-        f.write(f"CPU Load (%): Min={live_summary['cpu_min']:.1f}, Max={live_summary['cpu_max']:.1f}, Avg={live_summary['cpu_avg']:.1f}\n")
-        f.write(f"DSP Load (%): Min={live_summary['dsp_min']:.1f}, Max={live_summary['dsp_max']:.1f}, Avg={live_summary['dsp_avg']:.1f}\n")
-        f.write("\nLog Console Output:\n")
-        if log_console:
-            text = log_console.get("1.0", tk.END)
-            f.write(text)
-    log_debug(f"Summary saved to {summary_file}")
-
-    # 3) Optionally save raw sample buffers
-    np.savetxt(f"input_samples_{timestamp}.csv", list(waveform_insamples), delimiter=',', header='InputSamples', comments='')
-    np.savetxt(f"output_samples_{timestamp}.csv", list(waveform_outsamples), delimiter=',', header='OutputSamples', comments='')
-    log_debug(f"Raw buffers saved to input_samples_{timestamp}.csv and output_samples_{timestamp}.csv")
-
 def clear_data():
+    """Reset UI Screen."""
     frame_numbers.clear()
     avg_amps.clear()
     latencies.clear()
@@ -273,16 +274,17 @@ def clear_data():
     if log_console:
         log_console.delete("1.0", tk.END)
 
-    global waveform_insamples, waveform_outsamples, fft_index
+    global waveform_insamples, waveform_outsamples, fft_index, modeDisplay
     with waveform_lock:
         waveform_insamples.clear()
         waveform_outsamples.clear()
     fft_index = 0
-    bass_slider.set(0)
+    toggle_filter.state = True;
+    filter_btn.config(text=f"Filter On", bg='green')
+    modeDisplay = "false"
     log_debug("[Cleared] Graph and logs reset")
 
 def send_command(cmd):
-    global connected
     global sock_cmd
 
     if MODE == "ip":
@@ -327,17 +329,13 @@ def highlight_buttons():
         dsp_button.config(bg="green")
 
 def update_live_summary(line):
+    """Refresh UI """
     global live_summary
     try:
         if line.startswith("[Live Summary] Frames:"):
             # Example: "[Live Summary] Frames: 120"
             parts = line.split(":")
             live_summary["frames"] = int(parts[1].strip())
-            if live_summary["frames"] <= 20:
-                save_data_and_logs()
-                clear_data()
-            FRAME_SIZE = 256
-            SAMPLE_RATE = 48000
         elif line.startswith("[Live Summary] Latency"):
             m = re.search(r"Min:\s*([\d.]+),\s*Max:\s*([\d.]+),\s*Avg:\s*([\d.]+)", line)
             if m:
@@ -369,12 +367,70 @@ def update_live_summary(line):
     except Exception as e:
         log_debug("Live summary parse error: " + str(e))
 
-waveform_insamples=deque(maxlen=MAX_SAMPLES)
-waveform_outsamples=deque(maxlen=MAX_SAMPLES)
+def inrecv_exact(size):
+    global sock_input_data
+    buf = b''
+    while len(buf) < size:
+        chunk = sock_input_data.recv(size - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+def outrecv_exact(size):
+    global sock_output_data
+    buf = b''
+    while len(buf) < size:
+        chunk = sock_output_data.recv(size - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+def read_input_audio_samples():
+    """Read input audio samples from socket and add to global buffer."""
+    while True:
+        if connected_input_data:
+            header = inrecv_exact(4)
+            if not header:
+                break
+            if header != b'INPT':
+                print(f"[INPUT WARN] Unknown tag: {header}")
+                continue
+            data = inrecv_exact(512)
+            if not data:
+                break
+            samples = np.frombuffer(data, dtype=np.int16)
+            ch0_samples = samples.tolist()
+
+            # Add to waveform_insamples
+            with waveform_lock:
+                waveform_insamples.extend(ch0_samples)
+
+def read_output_audio_samples():
+    """Read output audio samples from socket and add to global buffer."""
+    while True:
+        if connected_output_data:
+            header = outrecv_exact(4)
+            if not header:
+                break
+            if header != b'OUTP':
+                print(f"[OUTPUT WARN] Unknown tag: {header}")
+                continue
+            data = outrecv_exact(512)
+            if not data:
+                break
+            samples = np.frombuffer(data, dtype=np.int16)
+            ch0_samples = samples.tolist()
+
+            # Add to waveform_insamples
+            with waveform_lock:
+                waveform_outsamples.extend(ch0_samples)
 
 def read_data():
+    """Read logs from socket and add to global buffers."""
     global sock
-    global waveform_insamples, waveform_outsamples, connected
+    global waveform_insamples, waveform_outsamples, connected, connected_input_data
 
     recv_buffer = ""
 
@@ -383,6 +439,8 @@ def read_data():
             if not connected:
                 wait_for_connection()
                 wait_for_cmd()
+                wait_for_indata()
+                wait_for_outdata()
                 log_debug("Connected via IP")
         try:
             if MODE == "ip":
@@ -392,6 +450,7 @@ def read_data():
             elif MODE == "uart":
                 if ser is not None:
                     data = ser.read(1024).decode()
+                    connected = True
                 else:
                     continue
 
@@ -402,45 +461,6 @@ def read_data():
                 line = line.strip().replace('\r', '')
                 if not line:
                     continue
-
-                # Input waveform (IWAVE: or IWAVE0:, IWAVE1:, etc.)
-                if line.startswith("IWAVE"):
-                    try:
-                        inraw_line = line
-                        raw = inraw_line.split(":", 1)[1].strip().rstrip(',')
-                        tokens = raw.split(',')
-                        samples = []
-
-                        for tok in tokens:
-                            if tok.strip() and tok.strip() != '-':
-                                try:
-                                    val = int(tok.strip())
-                                    samples.append(val)
-                                except Exception as e:
-                                    print(f"Invalid Token: '{tok}'")
-                            with waveform_lock:
-                                waveform_insamples.extend(samples)
-                    except Exception as e:
-                        log_debug("IWAVE parse error: " + str(e))
-
-                # Output waveform (WAVE: or WAVE0:, WAVE1:, etc.)
-                elif line.startswith("WAVE"):
-                    try:
-                        raw_line = line
-                        raw = raw_line.split(":", 1)[1].strip().rstrip(',')
-                        tokens = raw.split(',')
-                        samples = []
-                        for tok in tokens:
-                            if tok.strip() and tok.strip() != '-':
-                                try:
-                                    val = int(tok.strip())
-                                    samples.append(val)
-                                except Exception as e:
-                                    print(f"Invalid Token: '{tok}'")
-                            with waveform_lock:
-                                waveform_outsamples.extend(samples)
-                    except Exception as e:
-                        log_debug("WAVE parse error: " + str(e))
 
                 # Live Summary handling
                 if "[Live Summary]" in line:
@@ -454,6 +474,7 @@ def read_data():
             if connected:
                 log_debug(f"Connection lost: {e}")
             connected = False
+            connected_input_data = False
             time.sleep(RETRY_INTERVAL)
 
 modeDisplay = "false"
@@ -492,13 +513,14 @@ def animate(i):
     ax1.clear()
     ax2.clear()
     ax3.clear()
-    ax4.clear()
-    ax5.clear()
+    if (MODE == "ip"):
+        ax4.clear()
+        ax5.clear()
     if not frame_numbers:
         return
 
-    ax1.plot(frame_numbers, avg_amps, label="Avg Amplitude (dBFS)")
-    ax1.set_ylabel("Amplitude (dBFS)")
+    ax1.plot(frame_numbers, avg_amps, label="Avg Amplitude")
+    ax1.set_ylabel("Amplitude")
     ax1.set_title("Average Amplitude")
     ax1.legend()
 
@@ -513,19 +535,21 @@ def animate(i):
         if modes[j] == "CPU":
             cpu_x.append(frame_numbers[j])
             cpu_y.append(latencies[j])
+            current_mode = "ARM"
         elif modes[j] == "DSP":
             dsp_x.append(frame_numbers[j])
             dsp_y.append(latencies[j])
+            current_mode = "DSP"
 
-    if cpu_x:
+    if current_mode == "ARM":
         ax2.plot(cpu_x, cpu_y, label="CPU Latency", color='blue')
         if modeDisplay == "false":
-            tk.Label(left_frame, text="Running on A53 (Linux)", font=("Helvetica", 14, "bold"), bg = "#f0f0f0", fg = "black").pack(pady=40)
+            mode_label.config(text="Running on A53 (Linux)")
             modeDisplay = "true"
-    if dsp_x:
+    if current_mode == "DSP":
         ax2.plot(dsp_x, dsp_y, label="DSP Latency", color='green')
         if modeDisplay == "false":
-            tk.Label(left_frame, text="Running on C7x", font=("Helvetica", 14, "bold"), bg = "#f0f0f0", fg = "black").pack(pady=40)
+            mode_label.config(text="Running on C7x")
             modeDisplay = "true"
 
     ax2.set_xlabel("Frame")
@@ -552,9 +576,9 @@ def animate(i):
     audio_band_labels = [f"{int(f/1000)}k" if f >= 1000 else str(f) for f in audio_band_ticks]
 
     # Input Spectrum
-    if len(waveform_insamples) >= FFT_SIZE:
+    if ((len(waveform_insamples) >= FFT_SIZE) and (MODE == "ip")):
+
         freqs, mag, spectrum = compute_spectrum(waveform_insamples)
-        #print(f"[INPUT DEBUG] Raw FFT peak magnitude: {np.max(np.abs(spec)):.2f}")
         ax4.plot(freqs, mag, color='green')
         ax4.set_title("Input Audio Spectrum")
         ax4.set_ylabel("Amplitude (dBFS)")
@@ -569,9 +593,8 @@ def animate(i):
         ax4.grid(True, axis='x', linestyle='--', alpha=0.5)
 
     # Output Spectrum
-    if len(waveform_outsamples) >= FFT_SIZE:
+    if ((len(waveform_outsamples) >= FFT_SIZE) and (MODE == "ip")):
         freqs, mag, spectrum = compute_spectrum(waveform_outsamples)
-        #print(f"[OUTPUT DEBUG] Raw FFT peak magnitude: {np.max(np.abs(spectrum)):.2f}")
         ax5.plot(freqs, mag, color='blue')
         ax5.set_title("Output Audio Spectrum")
         ax5.set_ylabel("Amplitude (dBFS)")
@@ -588,12 +611,19 @@ def animate(i):
 if MODE == "uart":
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
 
-threading.Thread(target=read_data, daemon=True).start()
+def toggle_filter():
+    """Toggle audio filter state and send command to device."""
+    toggle_filter.state = not toggle_filter.state
+    value = 1 if toggle_filter.state else 0
+    filter_btn.config(text=f"Filter {'On' if value else 'Off'}",
+            bg='green' if value else 'lightgray')
+    send_param_command("FFT FILTER", value)
 
+toggle_filter.state = True  # Initial state: ON
 
 # GUI Setup
 root = tk.Tk()
-root.title("Audio EQ GUI")
+root.title("Audio DSP OFFLOAD GUI")
 root.attributes("-fullscreen", True)
 left_frame = tk.Frame(root,width=370, bg="#f0f0f0")
 left_frame.pack(side=tk.LEFT, fill=tk.Y)
@@ -601,12 +631,13 @@ left_frame.pack_propagate(False)
 
 tk.Label(left_frame, text="Channel 1 Data Display", font=("Helvetica", 14, "bold"), bg = "#f0f0f0", fg = "black").pack(pady=20)
 
-tk.Label(left_frame, text="FFT Index", font=("Helvetica", 14, "bold"), bg = "#f0f0f0", fg = "black").pack(pady=20)
-bass_slider = tk.Scale(left_frame, from_=0, to=256, resolution=1, length=300, width=30, orient=tk.HORIZONTAL,
-    command=lambda val: send_param_command("FFT INDEX", val))
-bass_slider.set(0)
-bass_slider.pack(pady=5)
+tk.Label(left_frame, text="Filter Control", font=("Helvetica", 14, "bold"), bg="#f0f0f0", fg="black").pack(pady=20)
+filter_btn = tk.Button(left_frame, text="Filter ON", width=15, height=2, font=("Helvetica", 12, "bold"),
+                       command=toggle_filter, bg="green")
+filter_btn.pack(pady=5)
 
+mode_label = tk.Label(left_frame, text="Mode: --", font=("Helvetica", 14, "bold"), bg="#f0f0f0", fg="black")
+mode_label.pack(pady=40)
 
 middle_frame = tk.Frame(left_frame, bg="#f0f0f0")
 middle_frame.place(relx=0.5, rely=0.5, anchor="center")
@@ -616,10 +647,11 @@ lable_font = ("Helvetica", 12, "bold")
 summary_label = tk.Label(middle_frame, text="Live Summary", font=("Helvetica", 14, "bold"), bg = "#f0f0f0", fg = "black")
 summary_label.pack(pady=20)
 
-fig, (ax4, ax5, ax1, ax2, ax3) = plt.subplots(5, 1, figsize=(10, 11), constrained_layout=True)
-canvas = FigureCanvasTkAgg(fig, master=root)
-canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-ani = animation.FuncAnimation(fig, animate, interval=500)
+if (MODE == "ip"):
+    fig, (ax4, ax5, ax1, ax2, ax3) = plt.subplots(5, 1, figsize=(10, 11), constrained_layout=True)
+else:
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 11), constrained_layout=True)
+
 # Create a frame for the live summary
 live_summary_frame = tk.Frame(left_frame, bd=2, relief=tk.GROOVE)
 live_summary_frame.pack(pady=10, fill=tk.X)
@@ -639,5 +671,10 @@ cpu_label.pack(pady=5)
 
 dsp_label = tk.Label(middle_frame, text="DSP Load (%): Min: 0.0, Max: 0.0, Avg: 0.0", anchor="w", width=40, fg="darkorange", font=lable_font, bg="#f0f0f0")
 dsp_label.pack(pady=5)
+
+canvas = FigureCanvasTkAgg(fig, master=root)
+canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+ani = animation.FuncAnimation(fig, animate, interval=500)
+threading.Thread(target=read_data, daemon=True).start()
 root.bind('<Control-s>', save_data_and_logs)
 root.mainloop()
