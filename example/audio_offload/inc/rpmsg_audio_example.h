@@ -1,17 +1,11 @@
 #ifndef RPMSG_AUDIO_EXAMPLE_H
 #define RPMSG_AUDIO_EXAMPLE_H
 
-char CFG_FILE_PATH[] = "/etc/dsp_offload.cfg";
-
-
 #define CHANNELS        8
 #define SAMPLE_RATE     48000
 #define BITS_PER_SAMPLE 16
 #define FRAME_SIZE      (CHANNELS * (BITS_PER_SAMPLE / 8))
 #define NUM_FRAMES      256
-
-#define BASIC_EQ_FFT            1
-#define BASIC_PITCH_SHIFTING    0
 
 #define DEBUG 0
 #if DEBUG
@@ -37,7 +31,7 @@ typedef struct {
 typedef struct __attribute__((__packed__))
 {
 	float dsp_load;
-	int32_t zeroFFTLength;
+	int32_t filter_enabled;
 }
 params_t;
 
@@ -56,17 +50,11 @@ ipc_msg_buf_t;
 typedef enum { EXEC_ARM, EXEC_DSP } ExecMode;
 ExecMode current_mode = EXEC_ARM;
 
-int32_t arm_zero_fft_index = 0;
-
-#if BASIC_PITCH_SHIFTING
-float pitch_shift_factor = 2.0f;
-#endif
-
+bool filter_enabled = false;
 int start_requested = START_PLAY;
-
-pthread_t eq_thread;
+pthread_t audio_processing_thread;
 static int rpmsg_fd = -1;
-
+char CFG_FILE_PATH[] = "/etc/dsp_offload.cfg";
 void *map_base;
 char *dev_name = NULL;
 
