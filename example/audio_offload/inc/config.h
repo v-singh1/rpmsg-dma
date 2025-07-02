@@ -18,9 +18,10 @@ typedef struct {
 	int remote_endpoint;
 	int data_buffer_size;
 	int param_buffer_size;
-	int fft_bin_index;
+	bool fft_filter_enable;
 	bool is_host_eth_iface;
 	bool is_dsp_execution;
+	bool enable_audio_logging;
 } AppConfig;
 
 extern AppConfig app_config;
