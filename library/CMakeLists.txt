@@ -1,4 +1,4 @@
-file(GLOB LIB_SOURCES *.c)
+file(GLOB LIB_SOURCES src/*.c)
 
 # Build shared library
 add_library(ti_rpmsg_dma SHARED ${LIB_SOURCES})
@@ -23,3 +23,4 @@ target_include_directories(ti_rpmsg_dma
 )
 
 install(TARGETS ti_rpmsg_dma LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.h")
