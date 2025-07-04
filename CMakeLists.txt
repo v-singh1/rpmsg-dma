@@ -10,11 +10,11 @@ option(BUILD_LIB "Build the rpmsg_dma library" ON)
 option(BUILD_EXAMPLE "Build the audio_offload example" ON)
 
 # Global include path
-include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(${CMAKE_SOURCE_DIR}/library/include)
 
 # Conditionally add subdirectories
 if(BUILD_LIB)
-    add_subdirectory(src)
+    add_subdirectory(library)
 endif()
 
 if(BUILD_EXAMPLE)
