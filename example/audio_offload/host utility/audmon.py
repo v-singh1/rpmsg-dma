@@ -541,16 +541,19 @@ def animate(i):
             dsp_y.append(latencies[j])
             current_mode = "DSP"
 
-    if current_mode == "ARM":
-        ax2.plot(cpu_x, cpu_y, label="CPU Latency", color='blue')
-        if modeDisplay == "false":
-            mode_label.config(text="Running on A53 (Linux)")
-            modeDisplay = "true"
-    if current_mode == "DSP":
-        ax2.plot(dsp_x, dsp_y, label="DSP Latency", color='green')
-        if modeDisplay == "false":
-            mode_label.config(text="Running on C7x")
-            modeDisplay = "true"
+    try:
+        if current_mode == "ARM":
+            ax2.plot(cpu_x, cpu_y, label="CPU Latency", color='blue')
+            if modeDisplay == "false":
+                mode_label.config(text="Running on A53 (Linux)")
+                modeDisplay = "true"
+        if current_mode == "DSP":
+            ax2.plot(dsp_x, dsp_y, label="DSP Latency", color='green')
+            if modeDisplay == "false":
+                mode_label.config(text="Running on C7x")
+                modeDisplay = "true"
+    except Exception as e:
+        print(f"Animate error {e}")
 
     ax2.set_xlabel("Frame")
     ax2.set_ylabel("Latency (ms)")

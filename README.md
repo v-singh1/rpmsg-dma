@@ -9,9 +9,9 @@ Welcome to the project documentation for **RPMsg DMA Offload**. This project dem
 This repository contains:
 - A shared library `libti_rpmsg_dma.so` for interfacing with RPMsg and DMA Heaps
 - A demo application `rpmsg_audio_offload_example` that supports:
-  - FFT-based audio processing
+  - FFT-based audio processing (Band pass filtering)
   - ARM/DSP execution switching
-  - IP-based(ethernet) runtime control and logging
+  - IP-based(ethernet) and uart based monitoring, runtime control and logging
 
 ---
 
@@ -22,7 +22,7 @@ This repository contains:
 |         User Space         |
 |                             |
 |  +---------------------+    |
-|  | audio_offload | <- Example App
+|  | rpmsg_audio_offload_example | <- Example App
 |  +---------------------+    |
 |          |                 |
 |          v                 |
@@ -45,16 +45,17 @@ This repository contains:
 
 ## 🗂 Directory Layout
 ```
-include/                   - Public headers
-src/                       - Library source files
-lib/, obj/                 - Build outputs (ignored by git)
+library/include/                   - Public headers
+library/src/                       - Library source files
+library/lib/, library/obj          - Build outputs (ignored by git)
 example/audio_offload/
     ├── src/                    - Example source
     ├── inc/                    - Example headers
-    ├── audio_sample/           - Audio sample file (48Khz Mono)
+    ├── audio_sample/           - Audio sample file (8ch 48Khz
     ├── host utility/EQ_CTL.py  - Host side python utility to monitor and control EQ params
-    └── config/dsp_offload.cfg  - Runtime config file
-Makefile                        - Top-level build file
+    ├── firmware	        - C7 DSP firmware for examples
+    ├── config/dsp_offload.cfg  - Runtime config file
+Makefile
 ```
 
 ## RPMSG, DMABUF & FW LOADER API Documentation
@@ -136,13 +137,13 @@ Return Value
 ```
 To build the shared library and example application, install the following dependencies:
 
-- **CMake** (version 3.10 or newer)
-- **C compiler** (e.g., gcc)
-- **pkg-config**
-- **FFTW3** development files (`libfftw3-dev`)
-- **libsndfile** development files (`libsndfile1-dev`)
-- **ALSA** development files (`libasound2-dev`)
-- **ti-rpmsg-char** library (required, must be installed from Texas Instruments SDK or source)
+- CMake (version 3.10 or newer)
+- C compiler (e.g., gcc)
+- pkg-config
+- FFTW3 development files (`libfftw3-dev`)
+- libsndfile development files (`libsndfile1-dev`)
+- ALSA development files (`libasound2-dev`)
+- ti-rpmsg-char library (required, must be installed from Texas Instruments AM62x Linux SDK or source)
 
 ```
 
@@ -165,8 +166,9 @@ This installs:
 - The example binary to `/usr/bin`
 - The configuration file (`dsp_offload.cfg`) to `/etc`
 - The sample audio file (`sample_audio.wav`) to `/usr/share/`
+- The C7 DSP firmware file (`dsp_audio_filter_offload.c75ss0-0.release.strip.out`) to `/usr/lib/`
 
-**Optional:**  
+Optional:
 To build only the library or only the example, use:
 
 cmake -S . -B build -DBUILD_LIB=OFF    # disables library build
@@ -181,6 +183,7 @@ cmake -S . -B build -DBUILD_EXAMPLE=OFF # disables example build
     - `rpmsg_audio_offload_example` to `/usr/bin/`
     - `dsp_offload.cfg` to `/etc/dsp_offload.cfg`
     - `sample_audio.wav` to `/usr/share/sample_audio`
+    - `dsp_audio_filter_offload.c75ss0-0.release.strip.out` to `/usr/lib/`
 
 3. Run:
 rpmsg_audio_offload_example
@@ -191,10 +194,10 @@ rpmsg_audio_offload_example
 ## 📡 Ethernet Commands
 
 ```text
-SET FFT INDEX <value>
+SET FFT FILTER <value>
 `
 
-- Value: Integer FFT bin index (e.g. 1)
+- Value: Bool FFT Filter State (0: OFF, 1: ON)
 
 ---
 ```
