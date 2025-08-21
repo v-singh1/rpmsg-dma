@@ -204,6 +204,6 @@ SET FFT FILTER <value>
 
 ## 📄 License
 ```
-This project is licensed under the [MIT License](../LICENSE).
+This project is licensed under the [BSD 3-Clause](../LICENSE).
 
 ```
