@@ -1,6 +1,7 @@
 #include "speech_enhancement_pipeline.h"
 #include "pipeline_common.h"
 #include "audio_utils.h"
+#include "speech_chunk_range.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -50,7 +51,6 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
         const size_t MODEL_ELEMS    = require_param(sp, "model_elems",  stft_stage_ptr->stage_id.c_str());
         const size_t TOTAL_FRAMES   = require_param(sp, "total_frames", stft_stage_ptr->stage_id.c_str());
         const size_t BATCH_N        = require_param(sp, "batch_n",      stft_stage_ptr->stage_id.c_str());
-        const size_t PAD_FRAMES     = TOTAL_FRAMES % BATCH_N;
         const size_t NUM_BATCHES    = (TOTAL_FRAMES + BATCH_N - 1) / BATCH_N;
 
         // Read parameters from ISTFT stage (drives ISTFT-side buffers — TVM output may differ)
@@ -59,6 +59,13 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
         const size_t ISTFT_MODEL_ELEMS  = require_param(ip, "model_elems",  istft_stage_ptr->stage_id.c_str());
         const size_t ISTFT_TOTAL_FRAMES = require_param(ip, "total_frames", istft_stage_ptr->stage_id.c_str());
         const size_t ISTFT_BATCH_N      = require_param(ip, "batch_n",      istft_stage_ptr->stage_id.c_str());
+
+        if (state.pipeline_config.overlap_frames < -1 ||
+            (state.pipeline_config.overlap_frames > 0 &&
+             static_cast<size_t>(state.pipeline_config.overlap_frames) >= TOTAL_FRAMES))
+            throw PipelineError{"overlap_frames must be -1 (disabled) or in [0, total_frames)"};
+        if (ISTFT_HOP_SIZE != HOP_SIZE || ISTFT_TOTAL_FRAMES != TOTAL_FRAMES)
+            throw PipelineError{"Speech reconstruction requires matching STFT/ISTFT hop_size and total_frames"};
 
         // STFT-side buffer sizes (buf1, buf2, buf5)
         const size_t audio_batch_bytes       = BATCH_N      * HOP_SIZE    * sizeof(int16_t);
@@ -114,9 +121,7 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
         const size_t OVERLAP_FRAMES  = USE_OVERLAP
                                        ? static_cast<size_t>(state.pipeline_config.overlap_frames)
                                        : 0;
-        const size_t T_FRAMES        = OVERLAP_FRAMES / 2;
         const size_t HOP_FRAMES      = USE_OVERLAP ? TOTAL_FRAMES - OVERLAP_FRAMES : TOTAL_FRAMES;
-        const size_t T_SAMPLES       = T_FRAMES * HOP_SIZE;
         const size_t HOP_SAMPLES     = HOP_FRAMES * HOP_SIZE;
         const size_t CHUNK_SAMPLES   = TOTAL_FRAMES * HOP_SIZE;
 
@@ -183,23 +188,24 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
             const size_t chunk_frame_offset   = chunk_sample_offset / HOP_SIZE;
             const size_t num_batches_chunk    = NUM_BATCHES;
 
-            // Trim-reconstruct: which output samples to keep from this chunk
-            const size_t lo_sample = (USE_OVERLAP && chunk_idx > 0)            ? T_SAMPLES     : 0;
-            const size_t hi_sample = (USE_OVERLAP && chunk_idx < n_chunks - 1) ? CHUNK_SAMPLES - T_SAMPLES : CHUNK_SAMPLES;
+            const auto keep = speech_chunk_range(chunk_idx, n_chunks, CHUNK_SAMPLES,
+                                                 OVERLAP_FRAMES, HOP_SIZE,
+                                                 original_sample_count);
+            const size_t lo_sample = keep.begin;
+            const size_t hi_sample = keep.end;
 
             auto t_chunk_start = std::chrono::steady_clock::now();
 
             // Phase 1: STFT
             auto t_stft_start = std::chrono::steady_clock::now();
             for (size_t batch_idx = 0; batch_idx < num_batches_chunk; batch_idx++) {
-                const size_t frames_this_batch  = (batch_idx < NUM_BATCHES - 1) ? BATCH_N : PAD_FRAMES;
+                const size_t frames_this_batch  = std::min(BATCH_N, TOTAL_FRAMES - batch_idx * BATCH_N);
                 const size_t samples_this_batch = frames_this_batch * HOP_SIZE;
                 const size_t audio_offset       = chunk_sample_offset + batch_idx * BATCH_N * HOP_SIZE;
                 const uint64_t spectral_offset  = batch_idx * BATCH_N * MODEL_ELEMS * sizeof(float);
 
                 dma_buf1.begin_cpu_access();
                 std::fill_n(dma_buf1.data<std::byte>(), audio_batch_bytes, std::byte{});
-                audio_stream.send_frame(0, dma_buf1.data<std::byte>(), samples_this_batch * sizeof(int16_t));
                 if (audio_offset < audio_data.size()) {
                     const size_t available = std::min(samples_this_batch,
                                                       audio_data.size() - audio_offset);
@@ -286,14 +292,13 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
             }
 
             // Phase 5: ISTFT — collect full chunk output into temporary buffer
-            const size_t ISTFT_PAD_FRAMES  = ISTFT_TOTAL_FRAMES % ISTFT_BATCH_N;
             const size_t ISTFT_NUM_BATCHES = (ISTFT_TOTAL_FRAMES + ISTFT_BATCH_N - 1) / ISTFT_BATCH_N;
             std::vector<int16_t> chunk_output;
             chunk_output.reserve(CHUNK_SAMPLES);
 
             auto t_istft_start = std::chrono::steady_clock::now();
             for (size_t batch_idx = 0; batch_idx < ISTFT_NUM_BATCHES; batch_idx++) {
-                const size_t frames_this_batch  = (batch_idx < ISTFT_NUM_BATCHES - 1) ? ISTFT_BATCH_N : ISTFT_PAD_FRAMES;
+                const size_t frames_this_batch  = std::min(ISTFT_BATCH_N, ISTFT_TOTAL_FRAMES - batch_idx * ISTFT_BATCH_N);
                 const size_t samples_this_batch = frames_this_batch * ISTFT_HOP_SIZE;
                 const size_t audio_offset       = chunk_sample_offset + batch_idx * ISTFT_BATCH_N * ISTFT_HOP_SIZE;
                 const uint64_t spectral_offset  = batch_idx * ISTFT_BATCH_N * ISTFT_MODEL_ELEMS * sizeof(float);
@@ -346,7 +351,6 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                 }
 
                 std::copy_n(out_ptr, samples_this_batch, std::back_inserter(chunk_output));
-                audio_stream.send_frame(1, out_ptr, samples_this_batch * sizeof(int16_t));
                 dma_buf4.end_cpu_access();
             }
             double t_istft_ms = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -358,6 +362,15 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                 std::copy(chunk_output.begin() + static_cast<std::ptrdiff_t>(lo_sample),
                           chunk_output.begin() + static_cast<std::ptrdiff_t>(keep_end),
                           std::back_inserter(processed_audio_data));
+                // Publish only finalized samples, identical to the saved WAV. Pair
+                // input/output on the same source timeline and bound message size.
+                for (size_t offset = lo_sample; offset < keep_end; offset += 1024) {
+                    const size_t count = std::min(size_t{1024}, keep_end - offset);
+                    audio_stream.send_frame(0, audio_data.data() + chunk_sample_offset + offset,
+                                            count * sizeof(int16_t));
+                    audio_stream.send_frame(1, chunk_output.data() + offset,
+                                            count * sizeof(int16_t));
+                }
             }
 
             double t_chunk_ms = std::chrono::duration_cast<std::chrono::microseconds>(
